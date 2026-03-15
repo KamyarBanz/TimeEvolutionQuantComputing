@@ -28,6 +28,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trajectories", type=int, default=24)
     parser.add_argument("--seed", type=int, default=20260211)
     parser.add_argument(
+        "--no-qiskit-compare",
+        action="store_true",
+        help="Skip NumPy-vs-Qiskit comparison outputs.",
+    )
+    parser.add_argument(
         "--quick",
         action="store_true",
         help="Fast smoke run for iteration; reduces runtime and fidelity.",
@@ -43,6 +48,7 @@ def main() -> int:
             t_max=min(args.t_max, 3.0),
             n_times=min(args.n_times, 61),
             trotter_order_for_plots=2,
+            enable_qiskit_compare=not args.no_qiskit_compare,
             noise_p_x=args.noise_px,
             noise_p_z=args.noise_pz,
             noise_trajectories=min(args.trajectories, 8),
@@ -54,6 +60,7 @@ def main() -> int:
             t_max=args.t_max,
             n_times=args.n_times,
             trotter_order_for_plots=2,
+            enable_qiskit_compare=not args.no_qiskit_compare,
             noise_p_x=args.noise_px,
             noise_p_z=args.noise_pz,
             noise_trajectories=args.trajectories,

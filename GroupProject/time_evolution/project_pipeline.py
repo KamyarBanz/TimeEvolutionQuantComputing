@@ -9,6 +9,7 @@ import matplotlib
 import numpy as np
 from scipy.linalg import expm
 
+from GroupProject.time_evolution.qc import QiskitSimulationConfig, run_qiskit_trotter
 from GroupProject.time_evolution.spin_chain import (
     Boundary,
     apply_single_qubit_unitary,
@@ -43,6 +44,7 @@ class RunConfig:
     t_max: float = 6.0
     n_times: int = 121
     trotter_order_for_plots: int = 2
+    enable_qiskit_compare: bool = True
     noise_p_x: float = 0.002
     noise_p_z: float = 0.006
     noise_trajectories: int = 24
@@ -289,7 +291,11 @@ def observable_rmse(obs_ref: np.ndarray, obs_test: np.ndarray) -> float:
 
 
 def compute_fft2_magnitude(data: np.ndarray) -> np.ndarray:
-    return np.abs(np.fft.fftshift(np.fft.fft2(data)))
+    # Subtract the global mean to remove the DC (zero-frequency) component,
+    # so that the spectrum reveals only the dynamical fluctuations.
+    centered = data - np.mean(data)
+    ft = np.fft.fftshift(np.fft.fft2(centered))
+    return np.abs(ft) 
 
 
 def _save_spacetime_triptych(
@@ -328,6 +334,8 @@ def _save_fft_plot(fft_amp: np.ndarray, times: np.ndarray, title: str, out_path:
         origin="lower",
         aspect="auto",
         cmap="magma",
+        vmin=0.0,
+        vmax=10.0,
         extent=[k[0], k[-1], omega[0], omega[-1]],
     )
     ax.set_xlabel("wave number k")
@@ -370,6 +378,76 @@ def _save_error_plot(
     plt.close(fig)
 
 
+def _save_numpy_vs_qiskit_comparison(
+    obs_numpy: np.ndarray,
+    obs_qiskit: np.ndarray,
+    times: np.ndarray,
+    title: str,
+    out_path: Path,
+) -> None:
+    if obs_numpy.shape != obs_qiskit.shape:
+        raise ValueError("obs_numpy and obs_qiskit must have the same shape")
+
+    labels = ("<X_i(t)>", "<Y_i(t)>", "<Z_i(t)>")
+    diff = obs_numpy - obs_qiskit
+    diff_max = float(np.max(np.abs(diff)))
+    if diff_max < 1e-12:
+        diff_max = 1e-12
+
+    fig, axes = plt.subplots(3, 3, figsize=(14.0, 9.8), constrained_layout=True)
+    im_top = None
+    im_mid = None
+    im_bot = None
+    extent = [0, obs_numpy.shape[1] - 1, times[0], times[-1]]
+
+    for idx, label in enumerate(labels):
+        im_top = axes[0, idx].imshow(
+            obs_numpy[:, :, idx],
+            origin="lower",
+            aspect="auto",
+            vmin=-1.0,
+            vmax=1.0,
+            cmap="coolwarm",
+            extent=extent,
+        )
+        im_mid = axes[1, idx].imshow(
+            obs_qiskit[:, :, idx],
+            origin="lower",
+            aspect="auto",
+            vmin=-1.0,
+            vmax=1.0,
+            cmap="coolwarm",
+            extent=extent,
+        )
+        im_bot = axes[2, idx].imshow(
+            diff[:, :, idx],
+            origin="lower",
+            aspect="auto",
+            vmin=-diff_max,
+            vmax=diff_max,
+            cmap="PiYG",
+            extent=extent,
+        )
+
+        axes[0, idx].set_title(label)
+        axes[2, idx].set_xlabel("site i")
+
+    axes[0, 0].set_ylabel("NumPy\ntime t")
+    axes[1, 0].set_ylabel("Qiskit\ntime t")
+    axes[2, 0].set_ylabel("NumPy - Qiskit\ntime t")
+
+    if im_top is not None:
+        fig.colorbar(im_top, ax=axes[0, :], shrink=0.85, label="expectation")
+    if im_mid is not None:
+        fig.colorbar(im_mid, ax=axes[1, :], shrink=0.85, label="expectation")
+    if im_bot is not None:
+        fig.colorbar(im_bot, ax=axes[2, :], shrink=0.85, label="difference")
+
+    fig.suptitle(title)
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
 def run_case(case: ProjectCase, cfg: RunConfig, out_dir: Path) -> dict[str, object]:
     out_dir.mkdir(parents=True, exist_ok=True)
     times = np.linspace(0.0, cfg.t_max, cfg.n_times)
@@ -389,6 +467,23 @@ def run_case(case: ProjectCase, cfg: RunConfig, out_dir: Path) -> dict[str, obje
         order=cfg.trotter_order_for_plots,
     )
     obs_trotter = all_states_observables(states_trotter, L=case.L)
+    obs_qiskit: np.ndarray | None = None
+    if cfg.enable_qiskit_compare:
+        qiskit_cfg = QiskitSimulationConfig(
+            L=case.L,
+            Jz=case.Jz,
+            boundary=case.boundary,
+            init_pattern=case.init_pattern,
+            phi=case.phi,
+            rotate_site=case.rotate_site,
+        )
+        _, obs_qiskit, qiskit_bitstring, qiskit_rotate_site = run_qiskit_trotter(
+            cfg=qiskit_cfg,
+            times=times,
+            order=cfg.trotter_order_for_plots,
+        )
+        if qiskit_bitstring != bitstring or qiskit_rotate_site != rotate_site:
+            raise RuntimeError("initial-state mismatch between NumPy and Qiskit pipelines")
 
     obs_noisy = noisy_trotter_observables(
         state0=state0,
@@ -456,6 +551,7 @@ def run_case(case: ProjectCase, cfg: RunConfig, out_dir: Path) -> dict[str, obje
         "noise_p_z": cfg.noise_p_z,
         "noise_trajectories": cfg.noise_trajectories,
         "trotter_order_for_plots": cfg.trotter_order_for_plots,
+        "enable_qiskit_compare": cfg.enable_qiskit_compare,
         "trajectory_vs_exact_rmse": observable_rmse(obs_exact, obs_trotter),
         "noisy_vs_exact_rmse": observable_rmse(obs_exact, obs_noisy),
         "error_steps": steps,
@@ -464,21 +560,28 @@ def run_case(case: ProjectCase, cfg: RunConfig, out_dir: Path) -> dict[str, obje
         "rmse_order1": rmse_1,
         "rmse_order2": rmse_2,
     }
+    if obs_qiskit is not None:
+        metrics["qiskit_vs_numpy_rmse"] = observable_rmse(obs_trotter, obs_qiskit)
+        metrics["qiskit_vs_exact_rmse"] = observable_rmse(obs_exact, obs_qiskit)
 
     stem = case.name
-    np.savez_compressed(
-        out_dir / f"{stem}_data.npz",
-        times=times,
-        obs_exact=obs_exact,
-        obs_trotter=obs_trotter,
-        obs_noisy=obs_noisy,
-        fft_z=fft_z,
-        error_steps=np.asarray(steps, dtype=int),
-        infidelity_order1=np.asarray(infid_1, dtype=float),
-        infidelity_order2=np.asarray(infid_2, dtype=float),
-        rmse_order1=np.asarray(rmse_1, dtype=float),
-        rmse_order2=np.asarray(rmse_2, dtype=float),
-    )
+    npz_data: dict[str, np.ndarray] = {
+        "times": times,
+        "obs_exact": obs_exact,
+        "obs_trotter": obs_trotter,
+        "obs_noisy": obs_noisy,
+        "fft_z": fft_z,
+        "error_steps": np.asarray(steps, dtype=int),
+        "infidelity_order1": np.asarray(infid_1, dtype=float),
+        "infidelity_order2": np.asarray(infid_2, dtype=float),
+        "rmse_order1": np.asarray(rmse_1, dtype=float),
+        "rmse_order2": np.asarray(rmse_2, dtype=float),
+    }
+    if obs_qiskit is not None:
+        npz_data["obs_qiskit"] = obs_qiskit
+        npz_data["obs_numpy_minus_qiskit"] = obs_trotter - obs_qiskit
+
+    np.savez_compressed(out_dir / f"{stem}_data.npz", **npz_data)
 
     with (out_dir / f"{stem}_metrics.json").open("w", encoding="utf-8") as fh:
         json.dump(metrics, fh, ensure_ascii=False, indent=2)
@@ -492,6 +595,20 @@ def run_case(case: ProjectCase, cfg: RunConfig, out_dir: Path) -> dict[str, obje
         f"{case.name}: trotter order {cfg.trotter_order_for_plots}",
         out_dir / f"{stem}_spacetime_trotter.png",
     )
+    if obs_qiskit is not None:
+        _save_spacetime_triptych(
+            obs_qiskit,
+            times,
+            f"{case.name}: qiskit trotter order {cfg.trotter_order_for_plots}",
+            out_dir / f"{stem}_spacetime_qiskit.png",
+        )
+        _save_numpy_vs_qiskit_comparison(
+            obs_numpy=obs_trotter,
+            obs_qiskit=obs_qiskit,
+            times=times,
+            title=f"{case.name}: NumPy vs Qiskit",
+            out_path=out_dir / f"{stem}_numpy_vs_qiskit.png",
+        )
     _save_spacetime_triptych(
         obs_noisy,
         times,
